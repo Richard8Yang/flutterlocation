@@ -19,6 +19,7 @@ import android.util.SparseArray;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
 import com.google.android.gms.common.api.ApiException;
 import com.google.android.gms.common.api.ResolvableApiException;
@@ -37,6 +38,8 @@ import io.flutter.plugin.common.PluginRegistry;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.HashMap;
+import java.util.List;
+import java.util.function.Consumer;
 
 public class FlutterLocation
         implements PluginRegistry.RequestPermissionsResultListener, PluginRegistry.ActivityResultListener {
@@ -212,6 +215,52 @@ public class FlutterLocation
         }
     }
 
+    private HashMap<String, Object> fillLocationResult(Location location) {
+        HashMap<String, Object> loc = new HashMap<>();
+        loc.put("latitude", location.getLatitude());
+        loc.put("longitude", location.getLongitude());
+        loc.put("accuracy", (double) location.getAccuracy());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            loc.put("verticalAccuracy", (double) location.getVerticalAccuracyMeters());
+            loc.put("headingAccuracy", (double) location.getBearingAccuracyDegrees());
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            loc.put("elapsedRealtimeUncertaintyNanos", (double) location.getElapsedRealtimeUncertaintyNanos());
+        }
+
+        loc.put("provider", location.getProvider());
+        final Bundle extras = location.getExtras();
+        if (extras != null) {
+            loc.put("satelliteNumber", location.getExtras().getInt("satellites"));
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+            loc.put("elapsedRealtimeNanos", (double) location.getElapsedRealtimeNanos());
+
+            if (location.isFromMockProvider()) {
+                loc.put("isMock", (double) 1);
+            }
+        } else {
+            loc.put("isMock", (double) 0);
+        }
+
+        // Using NMEA Data to get MSL level altitude
+        if (mLastMslAltitude == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            loc.put("altitude", location.getAltitude());
+        } else {
+            loc.put("altitude", mLastMslAltitude);
+        }
+
+        loc.put("speed", (double) location.getSpeed());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            loc.put("speed_accuracy", (double) location.getSpeedAccuracyMetersPerSecond());
+        }
+        loc.put("heading", (double) location.getBearing());
+        loc.put("time", (double) location.getTime());
+
+        return loc;
+    }
+
     /**
      * Creates a callback for receiving location events.
      */
@@ -225,48 +274,7 @@ public class FlutterLocation
             public void onLocationResult(LocationResult locationResult) {
                 super.onLocationResult(locationResult);
                 Location location = locationResult.getLastLocation();
-                HashMap<String, Object> loc = new HashMap<>();
-                loc.put("latitude", location.getLatitude());
-                loc.put("longitude", location.getLongitude());
-                loc.put("accuracy", (double) location.getAccuracy());
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    loc.put("verticalAccuracy", (double) location.getVerticalAccuracyMeters());
-                    loc.put("headingAccuracy", (double) location.getBearingAccuracyDegrees());
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    loc.put("elapsedRealtimeUncertaintyNanos", (double) location.getElapsedRealtimeUncertaintyNanos());
-                }
-
-                loc.put("provider", location.getProvider());
-                final Bundle extras = location.getExtras();
-                if (extras != null) {
-                    loc.put("satelliteNumber", location.getExtras().getInt("satellites"));
-                }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
-                    loc.put("elapsedRealtimeNanos", (double) location.getElapsedRealtimeNanos());
-
-                    if (location.isFromMockProvider()) {
-                        loc.put("isMock", (double) 1);
-                    }
-                } else {
-                    loc.put("isMock", (double) 0);
-                }
-
-                // Using NMEA Data to get MSL level altitude
-                if (mLastMslAltitude == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-                    loc.put("altitude", location.getAltitude());
-                } else {
-                    loc.put("altitude", mLastMslAltitude);
-                }
-
-                loc.put("speed", (double) location.getSpeed());
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    loc.put("speed_accuracy", (double) location.getSpeedAccuracyMetersPerSecond());
-                }
-                loc.put("heading", (double) location.getBearing());
-                loc.put("time", (double) location.getTime());
-
+                HashMap<String, Object> loc = fillLocationResult(location);
                 if (getLocationResult != null) {
                     getLocationResult.success(loc);
                     getLocationResult = null;
@@ -454,7 +462,37 @@ public class FlutterLocation
                                     Looper.myLooper());
                         } else {// This should not happen according to Android documentation but it has been
                             // observed on some phones.
-                            sendError("UNEXPECTED_ERROR", e.getMessage(), null);
+                            // fallback to use LocationManager directly
+                            Consumer<Location> consumer = new Consumer<Location>() {
+                                @Override
+                                public void accept(Location location) {
+                                    if (location != null) {
+                                        HashMap<String, Object> loc = fillLocationResult(location);
+                                        if (getLocationResult != null) {
+                                            getLocationResult.success(loc);
+                                            getLocationResult = null;
+                                        }
+                                        if (events != null) {
+                                            events.success(loc);
+                                        }
+                                    } else {
+                                        sendError("UNEXPECTED_ERROR", "Location is null", null);
+                                    }
+                                }
+                            };
+                            List<String> providers = locationManager.getProviders(true);
+                            if (providers.contains(LocationManager.FUSED_PROVIDER)) {
+                                Log.i(TAG, "Using fused provider to get location");
+                                locationManager.getCurrentLocation(LocationManager.FUSED_PROVIDER, null, ContextCompat.getMainExecutor(activity), consumer);
+                            } else if (providers.contains(LocationManager.GPS_PROVIDER)) {
+                                Log.i(TAG, "using GPS provider to get location");
+                                locationManager.getCurrentLocation(LocationManager.GPS_PROVIDER, null, ContextCompat.getMainExecutor(activity), consumer);
+                            } else if (providers.contains(LocationManager.NETWORK_PROVIDER)) {
+                                Log.i(TAG, "using network provider to get location");
+                                locationManager.getCurrentLocation(LocationManager.NETWORK_PROVIDER, null, ContextCompat.getMainExecutor(activity), consumer);
+                            } else {
+                                sendError("UNEXPECTED_ERROR", "No location provider available", null);
+                            }
                         }
                     }
                 });
